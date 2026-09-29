@@ -120,6 +120,7 @@ class AbleSciAuto:
         self.username = None  # 存储用户名
         self.points = None    # 存储当前积分
         self.sign_days = None # 存储连续签到天数
+        self.csrf_param = "_csrf"
         self.notifier = Notifier()
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -144,9 +145,16 @@ class AbleSciAuto:
             response = self.session.get(login_url, headers=self.headers, timeout=30)
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, 'html.parser')
-                csrf_token = soup.find('input', {'name': '_csrf'})
-                if csrf_token:
-                    return csrf_token.get('value', '')
+                csrf_param = soup.find('meta', {'name': 'csrf-param'})
+                if csrf_param and csrf_param.get('content'):
+                    self.csrf_param = csrf_param['content']
+                csrf_input = soup.find('input', {'name': self.csrf_param})
+                if csrf_input and csrf_input.get('value'):
+                    return csrf_input['value']
+                csrf_meta = soup.find('meta', {'name': 'csrf-token'})
+                if csrf_meta and csrf_meta.get('content'):
+                    return csrf_meta['content']
+                self.log("登录页没有提供CSRF令牌", "error")
             else:
                 self.log(f"获取CSRF令牌失败，状态码: {response.status_code}", "error")
         except Exception as e:
@@ -167,10 +175,10 @@ class AbleSciAuto:
             return False
         
         login_data = {
-            "_csrf": csrf_token,
+            self.csrf_param: csrf_token,
             "email": self.email,
             "password": self.password,
-            "remember": "off"
+            "remember": 0
         }
         
         headers = self.headers.copy()
@@ -191,17 +199,37 @@ class AbleSciAuto:
                     # 尝试解析JSON响应
                     result = response.json()
                     if result.get("code") == 0:
-                        self.log(f"登录成功: {result.get('msg')}", "success")
-                        return True
+                        data = result.get("data") or {}
+                        confirm_token = data.get("confirm_token")
+                        confirm_csrf = data.get("confirm_csrf")
+                        if not confirm_token or not confirm_csrf:
+                            self.log("登录响应缺少确认信息", "error")
+                            return False
+                        confirm_response = self.session.post(
+                            "https://www.ablesci.com/site/confirm-login",
+                            data={self.csrf_param: confirm_csrf, "confirm_token": confirm_token},
+                            headers=headers,
+                            timeout=30,
+                        )
+                        if confirm_response.status_code != 200:
+                            self.log(f"确认登录失败，状态码: {confirm_response.status_code}", "error")
+                            return False
+                        confirmation = confirm_response.json()
+                        if confirmation.get("code") == 0 and (confirmation.get("data") or {}).get("confirmed") is True:
+                            self.log("登录成功并已确认会话", "success")
+                            return True
+                        self.log(f"确认登录失败: {confirmation.get('msg', '未确认会话')}", "error")
+                        return False
                     else:
-                        self.log(f"登录失败: {result.get('msg')}", "error")
+                        error_data = result.get("data") or {}
+                        if (error_data.get("error_code") == "CAPTCHA_REQUIRED"
+                                or error_data.get("captcha_required")
+                                or str(error_data.get("verify", 0)) == "1"):
+                            self.log("登录需要图片验证码，无法在无人值守的任务中完成", "error")
+                        else:
+                            self.log(f"登录失败: {result.get('msg')}", "error")
                 except json.JSONDecodeError:
-                    # 如果不是JSON，可能是HTML响应
-                    if "退出" in response.text:  # 检查登录成功标志
-                        self.log("登录成功", "success")
-                        return True
-                    else:
-                        self.log("登录失败: 无法解析响应", "error")
+                    self.log("登录或确认登录的响应不是有效JSON", "error")
             else:
                 self.log(f"登录请求失败，状态码: {response.status_code}", "error")
         except Exception as e:
@@ -316,6 +344,7 @@ class AbleSciAuto:
 
     def run(self):
         """执行完整的登录和签到流程"""
+        sign_result = False
         if self.login():
             # 登录成功后获取并显示用户信息
             self.get_user_info()
@@ -332,7 +361,7 @@ class AbleSciAuto:
                 self.display_summary(is_before_sign=False)
         
         # 返回日志内容，供主程序汇总
-        return self.notifier.get_content()
+        return self.notifier.get_content(), sign_result
 
 def get_accounts():
     """从环境变量获取所有账号"""
@@ -391,19 +420,22 @@ def main():
         global_notifier.log(f"请设置环境变量 {ENV_ACCOUNTS}，格式为：邮箱1:密码1[换行]邮箱2:密码2", "warning")
         if global_notifier.notify_enabled:
             global_notifier.send_notification()
-        return
+        return 1
     
     global_notifier.log(f"找到 {account_count} 个账号", "info")
     
     # 执行每个账号的签到任务
     all_logs = []
+    failed_accounts = 0
     for i, (email, password) in enumerate(accounts, 1):
         global_notifier.log(f"\n===== 开始处理第 {i}/{account_count} 个账号 =====", "info")
         
         # 创建并执行签到实例
         automator = AbleSciAuto(email, password)
-        account_log = automator.run()
+        account_log, succeeded = automator.run()
         all_logs.append(account_log)
+        if not succeeded:
+            failed_accounts += 1
         
         # 添加分隔符
         global_notifier.log(f"===== 完成第 {i}/{account_count} 个账号处理 =====", "info")
@@ -419,9 +451,10 @@ def main():
         summary_notifier.log_content = full_log.splitlines()
         summary_notifier.send_notification()
     
-    # 在GitHub Actions环境中输出日志内容
-    if IS_GITHUB_ACTIONS:
-        print(f"::set-output name=log_content::{full_log}")
+    if failed_accounts:
+        global_notifier.log(f"{failed_accounts}/{account_count} 个账号签到失败", "error")
+        return 1
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
