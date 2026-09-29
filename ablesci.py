@@ -309,7 +309,8 @@ class AbleSciAuto:
                     else:
                         msg = result.get('msg', '')
                         # 特殊处理已签到情况
-                        if "已经签到" in msg or "已签到" in msg:
+                        if ("已经签到" in msg or "已签到" in msg
+                                or ("今天已于" in msg and "签到" in msg)):
                             self.log(f"今日已签到: {msg}", "info")
                             return True
                         else:
